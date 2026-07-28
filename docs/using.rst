@@ -91,3 +91,49 @@ The bundle location needs to be set in rauc-hawkbit-updater's config:
 .. code-block:: cfg
 
   bundle_download_location = /tmp/rauc-hawkbit-updater/bundle.raucb
+
+.. _confirm-after-reboot-section:
+
+Deferred Update Confirmation
+----------------------------
+
+By default rauc-hawkbit-updater reports ``success`` to hawkBit as soon as RAUC
+has finished writing the (inactive) update slot -- that is, *before* the system
+has actually rebooted into it. If the new slot then fails to boot and the
+bootloader rolls back to the previous slot, hawkBit is never corrected and keeps
+showing a version the device is not running.
+
+Setting ``confirm_after_reboot=true`` in the :ref:`sec_ref_config_file` defers the
+final feedback until after the reboot. rauc-hawkbit-updater then reports
+``proceeding`` once the bundle is installed, persists a small state file under
+``data_directory``, and reboots. On subsequent polls it derives the verdict from
+RAUC's booted slot:
+
+* booted into the target slot and it is marked *good* -> report ``success``
+* booted into the target slot but not yet marked *good* -> keep waiting
+* booted back into the previous slot -> report ``failure``
+
+Requirements
+^^^^^^^^^^^^
+
+This feature only observes RAUC's slot status; it does not itself provide boot
+confirmation or rollback. Using it correctly requires:
+
+* **RAUC >= 1.10**.
+* **A working A/B boot-confirmation + rollback setup**: something marks the freshly
+  booted slot *good* only after a successful health check, and the bootloader rolls
+  back to the previous slot on failure. In particular, the target slot's boot status
+  must read *not good* until the health check passes -- a setup that marks slots
+  *good* at install time will report ``success`` prematurely and must not enable this
+  feature.
+* **The trial boot must resolve** (committed-good or rolled-back) in bounded time.
+  rauc-hawkbit-updater does not impose its own timeout.
+* **``data_directory`` on persistent, slot-shared storage** (see its config option).
+* **A reboot mechanism** -- either ``post_update_reboot=true`` or an external one.
+* **The hawkBit server keeps the action open** on ``proceeding`` and accepts feedback
+  for the action after the reboot.
+
+.. note::
+   While a confirmation is pending, rauc-hawkbit-updater ignores new deployment
+   offers so the still-open action is not reinstalled during the trial boot. Do not
+   enable this feature together with ``-r``/run-once mode.

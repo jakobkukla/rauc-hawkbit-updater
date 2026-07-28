@@ -8,8 +8,11 @@
  */
 
 #include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
 #include <glib.h>
 #include <glib/gprintf.h>
+#include <glib/gstdio.h>
 #include "rauc-installer.h"
 #include "hawkbit-client.h"
 #include "config-file.h"
@@ -114,6 +117,51 @@ static gboolean on_new_software_ready_cb(gpointer data)
         return G_SOURCE_REMOVE;
 }
 
+/**
+ * @brief Validate the runtime prerequisites of the confirm_after_reboot feature.
+ *
+ * @param[in]  config Config with confirm_after_reboot enabled
+ * @param[out] error  Error
+ * @return TRUE if all prerequisites are met, FALSE otherwise (error set)
+ */
+static gboolean check_confirm_after_reboot_requirements(Config *config, GError **error)
+{
+        g_autofree gchar *booted_slot = NULL;
+
+        g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
+
+        // The confirmation is driven by the poll loop across a reboot; run-once mode exits
+        // after a single poll and cannot re-evaluate the boot verdict.
+        if (run_once) {
+                g_set_error(error, G_OPTION_ERROR, G_OPTION_ERROR_BAD_VALUE,
+                            "'confirm_after_reboot' cannot be combined with run-once mode (-r)");
+                return FALSE;
+        }
+
+        if (!g_file_test(config->data_directory, G_FILE_TEST_IS_DIR)) {
+                g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_NOTDIR,
+                            "data_directory '%s' does not exist or is not a directory",
+                            config->data_directory);
+                return FALSE;
+        }
+        if (g_access(config->data_directory, W_OK) != 0) {
+                g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errno),
+                            "data_directory '%s' is not writable: %s",
+                            config->data_directory, g_strerror(errno));
+                return FALSE;
+        }
+
+        // Verify RAUC's D-Bus interface is reachable and exposes the booted slot / slot
+        // status this feature relies on.
+        if (!rauc_get_booted_slot(&booted_slot, NULL, NULL, error)) {
+                g_prefix_error(error,
+                               "RAUC slot status unavailable (required for confirm_after_reboot): ");
+                return FALSE;
+        }
+
+        return TRUE;
+}
+
 int main(int argc, char **argv)
 {
         g_autoptr(GError) error = NULL;
@@ -162,6 +210,13 @@ int main(int argc, char **argv)
         log_level = (opt_debug) ? G_LOG_LEVEL_MASK : config->log_level;
 
         setup_logging(PROGRAM, log_level, opt_output_systemd);
+
+        if (config->confirm_after_reboot &&
+            !check_confirm_after_reboot_requirements(config, &error)) {
+                g_printerr("%s\n", error->message);
+                return 5;
+        }
+
         hawkbit_init(config, on_new_software_ready_cb);
 
         return hawkbit_start_service_sync();

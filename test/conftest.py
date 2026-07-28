@@ -225,6 +225,53 @@ def rauc_dbus_install_failure(rauc_bundle):
     assert proc.isalive()
     assert proc.terminate(force=True)
 
+@pytest.fixture
+def rauc_dbus_install_success_scenario(rauc_bundle):
+    """
+    Factory starting a RAUC D-Bus dummy that mimics a successful installation and, on
+    completion, simulates a reboot into (or rollback from) the freshly installed slot. Used
+    by the confirm_after_reboot tests. Returns a callable taking the dummy's slot/boot
+    scenario arguments.
+    """
+    import pexpect
+
+    procs = []
+
+    def _start(*, primary='rootfs.1', boot_slot='rootfs.0', reboot_to=None,
+               reboot_boot_status=None):
+        cmd = (f'{sys.executable} -m rauc_dbus_dummy {rauc_bundle} '
+               f'--primary {primary} --boot-slot {boot_slot}')
+        if reboot_to:
+            cmd += f' --reboot-to {reboot_to}'
+        if reboot_boot_status:
+            cmd += f' --reboot-boot-status {reboot_boot_status}'
+
+        proc = run_pexpect(cmd, cwd=os.path.dirname(__file__))
+        proc.expect('Interface published')
+        procs.append(proc)
+        return proc
+
+    yield _start
+
+    for proc in procs:
+        assert proc.isalive()
+        assert proc.terminate(force=True)
+        proc.expect(pexpect.EOF)
+
+@pytest.fixture
+def confirm_config(adjust_config, tmp_path):
+    """
+    Adjusts the rauc-hawkbit-updater configuration to enable confirm_after_reboot with a
+    writable data_directory. Returns (config path, data_directory path).
+    """
+    data_dir = tmp_path / 'data'
+    data_dir.mkdir()
+    config = adjust_config({'client': {
+        'confirm_after_reboot': 'true',
+        'data_directory': str(data_dir),
+    }})
+    return config, data_dir
+
 @pytest.fixture(scope='session')
 def pki_dir():
     return f'{os.path.dirname(__file__)}/pki'

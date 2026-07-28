@@ -18,6 +18,7 @@ static const gint DEFAULT_RETRY_WAIT      = 5 * 60; // 5 min.
 static const gboolean DEFAULT_SSL         = TRUE;
 static const gboolean DEFAULT_SSL_VERIFY  = TRUE;
 static const gboolean DEFAULT_REBOOT      = FALSE;
+static const gboolean DEFAULT_CONFIRM_AFTER_REBOOT = FALSE;
 static const gchar* DEFAULT_LOG_LEVEL     = "message";
 static const gboolean DEFAULT_SEND_DOWNLOAD_AUTHENTICATION = TRUE;
 
@@ -383,6 +384,11 @@ Config* load_config_file(const gchar *config_file, GError **error)
         if (!get_key_bool(ini_file, "client", "post_update_reboot", &config->post_update_reboot, DEFAULT_REBOOT, error))
                 return NULL;
 
+        if (!get_key_bool(ini_file, "client", "confirm_after_reboot",
+                          &config->confirm_after_reboot, DEFAULT_CONFIRM_AFTER_REBOOT, error))
+                return NULL;
+        get_key_string(ini_file, "client", "data_directory", &config->data_directory, NULL, NULL);
+
         if (!get_key_bool(ini_file, "client", "send_download_authentication",
                           &config->send_download_authentication,
                           DEFAULT_SEND_DOWNLOAD_AUTHENTICATION, error))
@@ -403,6 +409,18 @@ Config* load_config_file(const gchar *config_file, GError **error)
                 return NULL;
         }
 
+        if (config->confirm_after_reboot) {
+                if (!config->data_directory) {
+                        g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_KEY_NOT_FOUND,
+                                    "'data_directory' is required if 'confirm_after_reboot' is enabled");
+                        return NULL;
+                }
+                if (!config->post_update_reboot)
+                        g_warning("'confirm_after_reboot' is enabled but 'post_update_reboot' is not; "
+                                  "the deferred update will only be confirmed if the system is rebooted "
+                                  "by some external mechanism.");
+        }
+
         return g_steal_pointer(&config);
 }
 
@@ -420,6 +438,7 @@ void config_file_free(Config *config)
         g_free(config->ssl_key);
         g_free(config->ssl_cert);
         g_free(config->bundle_download_location);
+        g_free(config->data_directory);
         if (config->device)
                 g_hash_table_destroy(config->device);
         g_free(config);

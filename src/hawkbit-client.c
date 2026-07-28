@@ -35,6 +35,9 @@
 #endif
 
 #include "hawkbit-client.h"
+#include "rauc-installer.h"
+
+#define PENDING_STATE_FILENAME "pending-confirmation"
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(FILE, fclose)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(CURL, curl_easy_cleanup)
@@ -881,28 +884,161 @@ static void process_deployment_cleanup()
                 g_warning("Failed to delete file: %s", hawkbit_config->bundle_download_location);
 }
 
+/**
+ * @brief Build the path to the pending-confirmation state file, or NULL if no
+ *        data_directory is configured.
+ */
+static gchar *pending_state_path(void)
+{
+        if (!hawkbit_config->data_directory)
+                return NULL;
+
+        return g_build_filename(hawkbit_config->data_directory, PENDING_STATE_FILENAME, NULL);
+}
+
+/**
+ * @brief Atomically persist the pending-confirmation state.
+ *
+ * Writes {action_id, target_slot, transaction} in one atomic replace (temp file + rename),
+ * so the state file is only ever observed absent or complete.
+ *
+ * @param[in]  action_id   DDI action id of the deferred deployment
+ * @param[in]  target_slot slot the bundle was installed to (from GetPrimary)
+ * @param[in]  transaction target slot's installed.transaction, or NULL
+ * @param[out] error       Error
+ * @return TRUE on success, FALSE otherwise (error set)
+ */
+static gboolean pending_state_write(const gchar *action_id, const gchar *target_slot,
+                                    const gchar *transaction, GError **error)
+{
+        g_autofree gchar *path = pending_state_path();
+        g_autoptr(GKeyFile) key_file = g_key_file_new();
+        g_autofree gchar *data = NULL;
+        gsize length;
+
+        g_return_val_if_fail(action_id, FALSE);
+        g_return_val_if_fail(target_slot, FALSE);
+        g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
+
+        if (!path) {
+                g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_NOT_FOUND,
+                            "No data_directory configured");
+                return FALSE;
+        }
+
+        g_key_file_set_string(key_file, "pending", "action_id", action_id);
+        g_key_file_set_string(key_file, "pending", "target_slot", target_slot);
+        if (transaction)
+                g_key_file_set_string(key_file, "pending", "transaction", transaction);
+
+        data = g_key_file_to_data(key_file, &length, NULL);
+
+        // g_file_set_contents() writes to a temp file and rename()s it into place, so a
+        // crash leaves either the old file or the complete new one, never a partial write
+        return g_file_set_contents(path, data, length, error);
+}
+
+/**
+ * @brief Read the pending-confirmation state.
+ *
+ * A missing, malformed or incomplete state file is treated as "no pending confirmation"
+ * (returns FALSE) for robustness.
+ *
+ * @param[out] action_id   Newly allocated action id, or NULL to ignore
+ * @param[out] target_slot Newly allocated target slot, or NULL to ignore
+ * @param[out] transaction Newly allocated transaction (may be set NULL), or NULL to ignore
+ * @return TRUE if a valid pending state exists, FALSE otherwise
+ */
+static gboolean pending_state_read(gchar **action_id, gchar **target_slot, gchar **transaction)
+{
+        g_autofree gchar *path = pending_state_path();
+        g_autoptr(GKeyFile) key_file = g_key_file_new();
+        g_autoptr(GError) error = NULL;
+        g_autofree gchar *id = NULL, *slot = NULL;
+
+        if (!path || !g_file_test(path, G_FILE_TEST_EXISTS))
+                return FALSE;
+
+        if (!g_key_file_load_from_file(key_file, path, G_KEY_FILE_NONE, &error)) {
+                g_warning("Ignoring unreadable pending-confirmation state '%s': %s", path,
+                          error->message);
+                return FALSE;
+        }
+
+        id = g_key_file_get_string(key_file, "pending", "action_id", NULL);
+        slot = g_key_file_get_string(key_file, "pending", "target_slot", NULL);
+        if (!id || !slot) {
+                g_warning("Ignoring incomplete pending-confirmation state '%s'", path);
+                return FALSE;
+        }
+
+        if (transaction)
+                *transaction = g_key_file_get_string(key_file, "pending", "transaction", NULL);
+        if (action_id)
+                *action_id = g_steal_pointer(&id);
+        if (target_slot)
+                *target_slot = g_steal_pointer(&slot);
+
+        return TRUE;
+}
+
+/**
+ * @brief Delete the pending-confirmation state file (no-op if absent).
+ */
+static void pending_state_clear(void)
+{
+        g_autofree gchar *path = pending_state_path();
+
+        if (path && g_remove(path) != 0 && errno != ENOENT)
+                g_warning("Failed to remove pending-confirmation state '%s': %s", path,
+                          g_strerror(errno));
+}
+
 gboolean install_complete_cb(gpointer ptr)
 {
-        gboolean res = FALSE;
-        g_autoptr(GError) error = NULL;
         struct on_install_complete_userdata *result = ptr;
-        g_autofree gchar *feedback_url = NULL;
+        g_autoptr(GError) error = NULL;
+        g_autofree gchar *target_slot = NULL, *transaction = NULL, *feedback_url = NULL;
+        gboolean deferred = FALSE;
 
         g_return_val_if_fail(ptr, FALSE);
 
         g_mutex_lock(&active_action->mutex);
-
-        active_action->state = result->install_success ? ACTION_STATE_SUCCESS : ACTION_STATE_ERROR;
         feedback_url = build_api_url("deploymentBase/%s/feedback", active_action->id);
-        res = feedback(
-                feedback_url, active_action->id,
-                result->install_success ? "Software bundle installed successfully."
-                : "Failed to install software bundle.",
-                result->install_success ? "success" : "failure",
-                "closed", &error);
 
-        if (!res)
-                g_warning("%s", error->message);
+        // For a successful install with confirm_after_reboot, defer the final feedback:
+        // persist the installed (primary) slot and report "proceeding" instead of
+        // "success", letting the poll loop send the verdict after the reboot.
+        if (result->install_success && hawkbit_config->confirm_after_reboot) {
+                if (rauc_get_primary(&target_slot, &error)) {
+                        // transaction is advisory hardening; tolerate its absence
+                        rauc_get_slot_transaction(target_slot, &transaction, NULL);
+                        deferred = pending_state_write(active_action->id, target_slot,
+                                                       transaction, &error);
+                }
+
+                if (deferred) {
+                        active_action->state = ACTION_STATE_SUCCESS;
+                        if (!feedback_progress(feedback_url, active_action->id,
+                                               "Software bundle installed, confirming after reboot.",
+                                               &error))
+                                g_warning("%s", error->message);
+                } else {
+                        g_warning("Cannot defer update confirmation (reporting success now): %s",
+                                  error->message);
+                        g_clear_error(&error);
+                }
+        }
+
+        if (!deferred) {
+                active_action->state = result->install_success ? ACTION_STATE_SUCCESS
+                                       : ACTION_STATE_ERROR;
+                if (!feedback(feedback_url, active_action->id,
+                              result->install_success ? "Software bundle installed successfully."
+                              : "Failed to install software bundle.",
+                              result->install_success ? "success" : "failure", "closed", &error))
+                        g_warning("%s", error->message);
+        }
 
         process_deployment_cleanup();
         g_mutex_unlock(&active_action->mutex);
@@ -1424,6 +1560,72 @@ typedef struct ClientData_ {
 } ClientData;
 
 /**
+ * @brief If a deferred update confirmation is pending, compute the post-reboot verdict and
+ *        report it to hawkBit.
+ *
+ * Reads the persisted pending state and derives the verdict from the booted slot:
+ *  - booted into the target slot and it is marked good -> report "closed"/"success"
+ *  - booted into the target slot but not yet marked good -> keep waiting
+ *  - booted a different slot (rolled back) -> report "closed"/"failure"
+ * The state file is cleared once the feedback is accepted (or the action no longer exists
+ * server-side); on transient errors it is retained and retried on the next poll.
+ *
+ * @return TRUE if a confirmation is pending (whether or not it resolved this poll), FALSE
+ *         if there is nothing pending
+ */
+static gboolean confirm_pending_deployment(void)
+{
+        g_autoptr(GError) error = NULL;
+        g_autofree gchar *action_id = NULL, *target_slot = NULL, *transaction = NULL;
+        g_autofree gchar *booted_slot = NULL, *boot_status = NULL, *booted_transaction = NULL;
+        g_autofree gchar *feedback_url = NULL;
+        gboolean success;
+
+        if (!pending_state_read(&action_id, &target_slot, &transaction))
+                return FALSE;
+
+        if (!rauc_get_booted_slot(&booted_slot, &boot_status, &booted_transaction, &error)) {
+                g_warning("Cannot determine boot verdict for pending confirmation, will retry: %s",
+                          error->message);
+                return TRUE;
+        }
+
+        if (!g_strcmp0(booted_slot, target_slot)) {
+                // booted into the target slot: confirmed once the slot is marked good
+                if (g_strcmp0(boot_status, "good") != 0) {
+                        g_debug("Update to slot %s not yet confirmed (boot-status: %s), waiting.",
+                                target_slot, boot_status ? boot_status : "unknown");
+                        return TRUE;
+                }
+                // advisory hardening: warn (but still confirm) if a different transaction
+                // wrote to the slot since our install
+                if (transaction && booted_transaction &&
+                    g_strcmp0(transaction, booted_transaction) != 0)
+                        g_warning("Booted slot %s has transaction %s, expected %s (confirming anyway).",
+                                  target_slot, booted_transaction, transaction);
+                success = TRUE;
+        } else {
+                success = FALSE;
+        }
+
+        feedback_url = build_api_url("deploymentBase/%s/feedback", action_id);
+        if (feedback(feedback_url, action_id,
+                     success ? "Update confirmed after reboot."
+                     : "Update rolled back to previous slot after reboot.",
+                     success ? "success" : "failure", "closed", &error)) {
+                pending_state_clear();
+        } else if (g_error_matches(error, RHU_HAWKBIT_CLIENT_HTTP_ERROR, 404) ||
+                   g_error_matches(error, RHU_HAWKBIT_CLIENT_HTTP_ERROR, 410)) {
+                g_warning("Pending action %s no longer exists on server, dropping it.", action_id);
+                pending_state_clear();
+        } else {
+                g_warning("Failed to report update confirmation, will retry: %s", error->message);
+        }
+
+        return TRUE;
+}
+
+/**
  * @brief Callback for main loop, should run regularly, polls controller base poll resource and
  * triggers appropriate actions.
  *
@@ -1435,6 +1637,7 @@ static gboolean hawkbit_pull_cb(gpointer user_data)
 {
         ClientData *data = user_data;
         gboolean res = FALSE;
+        gboolean pending_confirmation = FALSE;
         g_autoptr(GError) error = NULL;
         g_autofree gchar *get_tasks_url = NULL;
         g_autoptr(JsonParser) json_response_parser = NULL;
@@ -1474,6 +1677,13 @@ static gboolean hawkbit_pull_cb(gpointer user_data)
         // owned by the JsonParser and should never be modified or freed
         json_root = json_parser_get_root(json_response_parser);
 
+        // While a deferred update confirmation is pending, report its post-reboot verdict
+        // and suppress (re-)accepting the still-open deployment offer, which the server
+        // keeps re-offering until the reported version matches (otherwise we would
+        // reinstall the pending update during its trial boot).
+        if (hawkbit_config->confirm_after_reboot)
+                pending_confirmation = confirm_pending_deployment();
+
         if (json_contains(json_root, "$._links.configData")) {
                 // hawkBit has asked us to identify ourselves
                 res = identify(&error);
@@ -1483,16 +1693,21 @@ static gboolean hawkbit_pull_cb(gpointer user_data)
                 }
         }
         if (json_contains(json_root, "$._links.deploymentBase")) {
-                // hawkBit has a new deployment for us
-                g_mutex_lock(&active_action->mutex);
-                res = process_deployment(json_root, &error);
-                g_mutex_unlock(&active_action->mutex);
-                if (!res) {
-                        if (g_error_matches(error, RHU_HAWKBIT_CLIENT_ERROR,
-                                            RHU_HAWKBIT_CLIENT_ERROR_ALREADY_IN_PROGRESS))
-                                g_debug("%s", error->message);
-                        else
-                                g_warning("%s", error->message);
+                if (pending_confirmation) {
+                        g_debug("Ignoring deployment offer while an update confirmation is pending.");
+                        res = TRUE;
+                } else {
+                        // hawkBit has a new deployment for us
+                        g_mutex_lock(&active_action->mutex);
+                        res = process_deployment(json_root, &error);
+                        g_mutex_unlock(&active_action->mutex);
+                        if (!res) {
+                                if (g_error_matches(error, RHU_HAWKBIT_CLIENT_ERROR,
+                                                    RHU_HAWKBIT_CLIENT_ERROR_ALREADY_IN_PROGRESS))
+                                        g_debug("%s", error->message);
+                                else
+                                        g_warning("%s", error->message);
+                        }
                 }
         } else {
                 g_message("No new software.");

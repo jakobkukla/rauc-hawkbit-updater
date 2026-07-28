@@ -48,4 +48,40 @@ gboolean rauc_install(const gchar *bundle, const gchar *auth_header,
                 gchar *ssl_key, gchar *ssl_cert, gboolean ssl_verify,
                 GSourceFunc on_install_notify, GSourceFunc on_install_complete, gboolean wait);
 
+/**
+ * @brief Query RAUC for the primary (next-boot) slot.
+ *
+ * @param[out] primary Newly allocated primary slot name on success
+ * @param[out] error   Error
+ * @return TRUE on success, FALSE otherwise (error set)
+ */
+gboolean rauc_get_primary(gchar **primary, GError **error);
+
+/**
+ * @brief Query RAUC for the slot the system booted from and its status.
+ *
+ * The booted slot is the one RAUC marks with state "booted" in its slot status; it is
+ * returned as the RAUC slot name, directly comparable to rauc_get_primary()'s output.
+ *
+ * @param[out] booted_slot Newly allocated booted slot name on success
+ * @param[out] boot_status Newly allocated boot status ("good"/"bad"/...) or NULL, or NULL
+ *                         to ignore
+ * @param[out] transaction Newly allocated installed.transaction or NULL, or NULL to ignore
+ * @param[out] error       Error
+ * @return TRUE on success, FALSE otherwise (error set)
+ */
+gboolean rauc_get_booted_slot(gchar **booted_slot, gchar **boot_status,
+                gchar **transaction, GError **error);
+
+/**
+ * @brief Query the installed.transaction of a specific RAUC slot.
+ *
+ * @param[in]  slot        slot name to query (e.g. "rootfs.1")
+ * @param[out] transaction Newly allocated installed.transaction, or set to NULL if the
+ *                         slot has no recorded transaction
+ * @param[out] error       Error
+ * @return TRUE if the slot was found, FALSE otherwise (error set)
+ */
+gboolean rauc_get_slot_transaction(const gchar *slot, gchar **transaction, GError **error);
+
 #endif // __RAUC_INSTALLER_H__

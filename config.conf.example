@@ -53,6 +53,15 @@ download_speed_limit      = 0
 # reboot after a successful update
 post_update_reboot        = false
 
+# defer the success/failure report to hawkBit until after the reboot into the
+# updated slot, deriving the verdict from RAUC's booted slot (requires an A/B
+# boot-confirmation + rollback setup and data_directory, see docs)
+#confirm_after_reboot      = false
+
+# persistent, slot-shared directory for updater state (required if
+# confirm_after_reboot is enabled)
+#data_directory            = /var/lib/rauc-hawkbit-updater
+
 # debug, info, message, critical, error, fatal
 log_level                 = message
 

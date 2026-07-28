@@ -28,13 +28,29 @@ class Installer:
     Completed = signal()
     PropertiesChanged = signal()
 
-    def __init__(self, bundle, completed_code=0):
+    def __init__(self, bundle, completed_code=0, *, primary='rootfs.1', boot_slot='rootfs.0',
+                 slots=None, reboot_to=None, reboot_boot_status=None):
         self._bundle = bundle
         self._completed_code = completed_code
 
         self._operation = 'idle'
         self._last_error = ''
         self._progress = 0, '', 1
+
+        # slot state used by GetPrimary/GetSlotStatus/BootSlot (confirm_after_reboot)
+        self._primary = primary
+        self._boot_slot = boot_slot
+        self._slots = slots or {
+            'rootfs.0': {'device': '/dev/sda2', 'boot-status': 'good',
+                         'installed.transaction': '0000-0000-old'},
+            'rootfs.1': {'device': '/dev/sda3', 'boot-status': 'good',
+                         'installed.transaction': '1111-1111-new'},
+        }
+        # simulate the effect of a reboot once an install completes: switch the booted slot
+        # (and optionally its boot-status) to model committing to / rolling back from the
+        # freshly installed slot
+        self._reboot_to = reboot_to
+        self._reboot_boot_status = reboot_boot_status
 
     def InstallBundle(self, source, args):
         def mimic_install():
@@ -66,6 +82,12 @@ class Installer:
                 percentage = (i+1)*100 / len(progresses)
                 self.Progress = percentage, progress, 1
                 time.sleep(0.1)
+
+            # simulate the reboot into (or rollback from) the freshly installed slot
+            if not self._completed_code and self._reboot_to:
+                self._boot_slot = self._reboot_to
+                if self._reboot_boot_status:
+                    self._slots[self._reboot_to]['boot-status'] = self._reboot_boot_status
 
             self.Completed(self._completed_code)
 
@@ -183,6 +205,19 @@ class Installer:
         self._last_error = value
         self.PropertiesChanged(Installer.interface, {'LastError': self.LastError}, [])
 
+    def GetPrimary(self):
+        return self._primary
+
+    def GetSlotStatus(self):
+        result = []
+        for name, status in self._slots.items():
+            slot = {key: GLib.Variant('s', value) for key, value in status.items()}
+            # RAUC marks exactly the booted slot with state "booted"
+            slot['state'] = GLib.Variant('s', 'booted' if name == self._boot_slot
+                                         else 'inactive')
+            result.append((name, slot))
+        return result
+
     @property
     def Compatible(self):
         return "not implemented"
@@ -193,7 +228,7 @@ class Installer:
 
     @property
     def BootSlot(self):
-        return "not implemented"
+        return self._boot_slot
 
 
 if __name__ == '__main__':
@@ -204,11 +239,22 @@ if __name__ == '__main__':
     parser.add_argument('bundle', help='Expected RAUC bundle')
     parser.add_argument('--completed-code', type=int, default=0,
                         help='Code to emit as D-Bus Completed signal')
+    parser.add_argument('--primary', default='rootfs.1',
+                        help='Slot returned by GetPrimary (the install target)')
+    parser.add_argument('--boot-slot', default='rootfs.0',
+                        help='Initial BootSlot (slot the system booted from)')
+    parser.add_argument('--reboot-to', default=None,
+                        help='On a successful install, switch BootSlot to this slot to '
+                             'simulate the reboot into (or rollback from) the update')
+    parser.add_argument('--reboot-boot-status', default=None, choices=('good', 'bad'),
+                        help='boot-status of --reboot-to slot after the simulated reboot')
     args = parser.parse_args()
 
     loop = GLib.MainLoop()
     bus = SessionBus()
-    installer = Installer(args.bundle, args.completed_code)
+    installer = Installer(args.bundle, args.completed_code, primary=args.primary,
+                          boot_slot=args.boot_slot, reboot_to=args.reboot_to,
+                          reboot_boot_status=args.reboot_boot_status)
     with bus.publish('de.pengutronix.rauc', ('/', installer)):
         print('Interface published')
         loop.run()

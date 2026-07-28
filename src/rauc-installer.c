@@ -204,6 +204,147 @@ notify_complete:
         return NULL;
 }
 
+/**
+ * @brief Create a synchronous RAUC D-Bus proxy.
+ *
+ * Properties are not loaded since only methods (GetPrimary, GetSlotStatus) are used.
+ *
+ * @param[out] error Error
+ * @return new RInstaller proxy (unref with g_object_unref) or NULL (error set)
+ */
+static RInstaller *rauc_proxy_new(GError **error)
+{
+        GBusType bus_type = (!g_strcmp0(g_getenv("DBUS_STARTER_BUS_TYPE"), "session"))
+                            ? G_BUS_TYPE_SESSION : G_BUS_TYPE_SYSTEM;
+
+        return r_installer_proxy_new_for_bus_sync(
+                bus_type, G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
+                "de.pengutronix.rauc", "/", NULL, error);
+}
+
+gboolean rauc_get_primary(gchar **primary, GError **error)
+{
+        RInstaller *proxy = NULL;
+        gboolean res;
+
+        g_return_val_if_fail(primary && *primary == NULL, FALSE);
+        g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
+
+        proxy = rauc_proxy_new(error);
+        if (!proxy)
+                return FALSE;
+
+        res = r_installer_call_get_primary_sync(proxy, primary, NULL, error);
+
+        g_object_unref(proxy);
+        return res;
+}
+
+/**
+ * @brief Fetch RAUC's slot status array.
+ *
+ * @param[out] error Error
+ * @return new GVariant of type a(sa{sv}) (array of (slotname, status-dict) tuples), to be
+ *         unref'd by the caller, or NULL on failure (error set)
+ */
+static GVariant *rauc_get_slot_status(GError **error)
+{
+        RInstaller *proxy = NULL;
+        GVariant *slot_status = NULL;
+
+        g_return_val_if_fail(error == NULL || *error == NULL, NULL);
+
+        proxy = rauc_proxy_new(error);
+        if (!proxy)
+                return NULL;
+
+        r_installer_call_get_slot_status_sync(proxy, &slot_status, NULL, error);
+
+        g_object_unref(proxy);
+        return slot_status;
+}
+
+/**
+ * @brief Copy selected fields out of a slot's status dict (a{sv}).
+ *
+ * @param[in]  slot_dict   a slot's status dict
+ * @param[out] boot_status newly allocated boot-status if present, or NULL to ignore
+ * @param[out] transaction newly allocated installed.transaction if present, or NULL
+ */
+static void slot_dict_extract(GVariant *slot_dict, gchar **boot_status, gchar **transaction)
+{
+        const gchar *bs = NULL, *tx = NULL;
+
+        if (boot_status && g_variant_lookup(slot_dict, "boot-status", "&s", &bs))
+                *boot_status = g_strdup(bs);
+        if (transaction && g_variant_lookup(slot_dict, "installed.transaction", "&s", &tx))
+                *transaction = g_strdup(tx);
+}
+
+gboolean rauc_get_booted_slot(gchar **booted_slot, gchar **boot_status,
+                              gchar **transaction, GError **error)
+{
+        g_autoptr(GVariant) slot_status = NULL;
+        GVariantIter iter;
+        const gchar *slotname = NULL;
+        GVariant *slot_dict = NULL;
+
+        g_return_val_if_fail(booted_slot && *booted_slot == NULL, FALSE);
+        g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
+
+        slot_status = rauc_get_slot_status(error);
+        if (!slot_status)
+                return FALSE;
+
+        // the booted slot is the one RAUC marks with state "booted"
+        g_variant_iter_init(&iter, slot_status);
+        while (g_variant_iter_next(&iter, "(&s@a{sv})", &slotname, &slot_dict)) {
+                const gchar *state = NULL;
+
+                g_variant_lookup(slot_dict, "state", "&s", &state);
+                if (!g_strcmp0(state, "booted")) {
+                        *booted_slot = g_strdup(slotname);
+                        slot_dict_extract(slot_dict, boot_status, transaction);
+                        g_variant_unref(slot_dict);
+                        return TRUE;
+                }
+                g_variant_unref(slot_dict);
+        }
+
+        g_set_error(error, G_DBUS_ERROR, G_DBUS_ERROR_FAILED, "RAUC reported no booted slot");
+        return FALSE;
+}
+
+gboolean rauc_get_slot_transaction(const gchar *slot, gchar **transaction, GError **error)
+{
+        g_autoptr(GVariant) slot_status = NULL;
+        GVariantIter iter;
+        const gchar *slotname = NULL;
+        GVariant *slot_dict = NULL;
+
+        g_return_val_if_fail(slot, FALSE);
+        g_return_val_if_fail(transaction && *transaction == NULL, FALSE);
+        g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
+
+        slot_status = rauc_get_slot_status(error);
+        if (!slot_status)
+                return FALSE;
+
+        g_variant_iter_init(&iter, slot_status);
+        while (g_variant_iter_next(&iter, "(&s@a{sv})", &slotname, &slot_dict)) {
+                if (!g_strcmp0(slotname, slot)) {
+                        slot_dict_extract(slot_dict, NULL, transaction);
+                        g_variant_unref(slot_dict);
+                        return TRUE;
+                }
+                g_variant_unref(slot_dict);
+        }
+
+        g_set_error(error, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+                    "Slot '%s' not found in RAUC slot status", slot);
+        return FALSE;
+}
+
 gboolean rauc_install(const gchar *bundle, const gchar *auth_header,
                       gchar *ssl_key, gchar *ssl_cert, gboolean ssl_verify,
                       GSourceFunc on_install_notify, GSourceFunc on_install_complete,

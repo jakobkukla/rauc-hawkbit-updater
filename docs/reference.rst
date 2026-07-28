@@ -173,6 +173,36 @@ Optional options:
     manager and without terminating any processes or unmounting any file systems.
     This may result in data loss.
 
+``confirm_after_reboot=<boolean>``
+  Whether to defer the final success/failure feedback to hawkBit until *after* the
+  reboot into the updated slot, instead of reporting success immediately once the
+  bundle has been installed.
+  Defaults to ``false``.
+
+  When enabled, rauc-hawkbit-updater reports ``proceeding`` after a successful
+  installation, persists a small state file under :ref:`data_directory
+  <data-directory-section>`, and reboots. On subsequent polls it derives a verdict
+  from RAUC's booted slot and its boot status and only then reports ``success``
+  (booted into the target slot and it was marked good) or ``failure`` (rolled back
+  to the previous slot). This keeps the server from recording a target version that
+  a device never actually committed to.
+
+  Requires ``data_directory`` to be set. See :ref:`confirm-after-reboot-section` for
+  the full list of requirements this imposes on the integration (A/B rollback,
+  boot-status semantics, persistent slot-shared storage).
+
+.. _data-directory-section:
+
+``data_directory=<path>``
+  Directory used by rauc-hawkbit-updater to persist state across reboots.
+  Currently only used by ``confirm_after_reboot`` (for the pending-confirmation
+  state file). Required when ``confirm_after_reboot`` is enabled.
+
+  .. important::
+    The directory must be on storage that survives reboots **and is shared across
+    both A/B slots**. If it lands on per-slot storage, the trial boot cannot find
+    the pending-confirmation state and the still-open action would be reinstalled.
+
 ``log_level=<level>``
   Log level to print, where ``level`` is a string of
 
