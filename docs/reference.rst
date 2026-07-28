@@ -187,9 +187,9 @@ Optional options:
   to the previous slot). This keeps the server from recording a target version that
   a device never actually committed to.
 
-  Requires ``data_directory`` to be set. See :ref:`confirm-after-reboot-section` for
-  the full list of requirements this imposes on the integration (A/B rollback,
-  boot-status semantics, persistent slot-shared storage).
+  Requires ``data_directory`` and ``post_update_reboot=true`` to be set. See
+  :ref:`confirm-after-reboot-section` for the full list of requirements this imposes on the
+  integration (A/B rollback, boot-status semantics, persistent slot-shared storage).
 
 .. _data-directory-section:
 

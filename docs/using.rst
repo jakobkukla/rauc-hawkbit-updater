@@ -129,7 +129,10 @@ confirmation or rollback. Using it correctly requires:
 * **The trial boot must resolve** (committed-good or rolled-back) in bounded time.
   rauc-hawkbit-updater does not impose its own timeout.
 * **``data_directory`` on persistent, slot-shared storage** (see its config option).
-* **A reboot mechanism** -- either ``post_update_reboot=true`` or an external one.
+* **``post_update_reboot=true``** -- required. The verdict relies on the updater rebooting
+  immediately after the deferred install, so the confirmation is only ever evaluated after
+  a reboot has actually happened. It is therefore rejected at startup if
+  ``confirm_after_reboot`` is enabled without ``post_update_reboot``.
 * **The hawkBit server keeps the action open** on ``proceeding`` and accepts feedback
   for the action after the reboot.
 

@@ -415,10 +415,11 @@ Config* load_config_file(const gchar *config_file, GError **error)
                                     "'data_directory' is required if 'confirm_after_reboot' is enabled");
                         return NULL;
                 }
-                if (!config->post_update_reboot)
-                        g_warning("'confirm_after_reboot' is enabled but 'post_update_reboot' is not; "
-                                  "the deferred update will only be confirmed if the system is rebooted "
-                                  "by some external mechanism.");
+                if (!config->post_update_reboot) {
+                        g_set_error(error, G_KEY_FILE_ERROR, G_KEY_FILE_ERROR_INVALID_VALUE,
+                                    "'post_update_reboot' is required if 'confirm_after_reboot' is enabled");
+                        return NULL;
+                }
         }
 
         return g_steal_pointer(&config);

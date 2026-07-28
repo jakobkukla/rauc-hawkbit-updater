@@ -55,7 +55,8 @@ post_update_reboot        = false
 
 # defer the success/failure report to hawkBit until after the reboot into the
 # updated slot, deriving the verdict from RAUC's booted slot (requires an A/B
-# boot-confirmation + rollback setup and data_directory, see docs)
+# boot-confirmation + rollback setup, post_update_reboot=true and data_directory,
+# see docs)
 #confirm_after_reboot      = false
 
 # persistent, slot-shared directory for updater state (required if

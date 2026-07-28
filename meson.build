@@ -97,3 +97,12 @@ executable('rauc-hawkbit-updater',
   dependencies : [libcurldep, giodep, giounixdep, jsonglibdep, libsystemddep],
   include_directories : incdir,
   install: true)
+
+# Test helper: LD_PRELOAD shim that neutralizes reboot(), so the confirm_after_reboot
+# tests can run the full install/reboot/confirm flow without rebooting the host. Not
+# installed and not linked into the updater.
+shared_module('fake_reboot', 'test/fake_reboot.c',
+  name_prefix : '',
+  install : false,
+  c_args : ['-fno-sanitize=all'],
+  link_args : ['-fno-sanitize=all'])

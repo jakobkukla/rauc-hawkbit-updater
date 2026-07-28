@@ -229,9 +229,9 @@ def rauc_dbus_install_failure(rauc_bundle):
 def rauc_dbus_install_success_scenario(rauc_bundle):
     """
     Factory starting a RAUC D-Bus dummy that mimics a successful installation and, on
-    completion, simulates a reboot into (or rollback from) the freshly installed slot. Used
-    by the confirm_after_reboot tests. Returns a callable taking the dummy's slot/boot
-    scenario arguments.
+    completion, simulates the reboot into (or rollback from) the freshly installed slot by
+    switching the booted slot. Used by the confirm_after_reboot tests. Returns a callable
+    taking the slot/boot scenario arguments.
     """
     import pexpect
 
@@ -262,12 +262,14 @@ def rauc_dbus_install_success_scenario(rauc_bundle):
 def confirm_config(adjust_config, tmp_path):
     """
     Adjusts the rauc-hawkbit-updater configuration to enable confirm_after_reboot with a
-    writable data_directory. Returns (config path, data_directory path).
+    writable data_directory. post_update_reboot is required by the feature. Returns
+    (config path, data_directory path).
     """
     data_dir = tmp_path / 'data'
     data_dir.mkdir()
     config = adjust_config({'client': {
         'confirm_after_reboot': 'true',
+        'post_update_reboot': 'true',
         'data_directory': str(data_dir),
     }})
     return config, data_dir
