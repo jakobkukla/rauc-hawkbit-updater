@@ -130,3 +130,69 @@ def test_confirm_pending(hawkbit, confirm_config, bundle_assigned,
 
     status = hawkbit.get_action_status()
     assert status[0]['type'] != 'finished'
+
+
+def test_confirm_cancel_during_trial_is_rejected(hawkbit, confirm_config, bundle_assigned,
+                                                 rauc_dbus_install_success_scenario,
+                                                 preload_fake_reboot):
+    """
+    While an update is installed and awaiting its post-reboot confirmation (trial boot not yet
+    marked good), a cancelation is too late to honor: it must be rejected rather than
+    acknowledged, the action must not end up canceled, and the pending confirmation retained.
+    """
+    config, data_dir = confirm_config
+    # booted into the target slot but not yet good -> stays in the awaiting-verdict window
+    rauc_dbus_install_success_scenario(reboot_to='rootfs.1', reboot_boot_status='bad')
+
+    proc = run_pexpect(f'rauc-hawkbit-updater -c "{config}"')
+
+    proc.expect('Software bundle installed, confirming after reboot')
+    # trial boot is pending: the action is now awaiting its verdict
+    proc.expect('not yet confirmed')
+
+    hawkbit.cancel_action()
+
+    # the cancel arrives while awaiting the verdict and must be rejected, not acknowledged
+    proc.expect('Cancelation impossible, update already installed and awaiting post-reboot '
+                'confirmation.', timeout=8)
+
+    # let the rejection feedback reach hawkBit
+    proc.expect(TIMEOUT, timeout=2)
+    proc.terminate(force=True)
+    proc.expect(EOF)
+
+    # the cancel did not take: the action is still running and the confirmation is retained
+    assert hawkbit.get_action()['status'] == 'running'
+    assert (data_dir / 'pending-confirmation').exists()
+
+
+def test_confirm_resumes_after_reboot(hawkbit, confirm_config, bundle_assigned,
+                                      rauc_dbus_install_success_scenario):
+    """
+    The production flow: the reboot yields a fresh process that finds the persisted pending
+    confirmation on disk. On startup the updater must resume it (rather than reinstalling the
+    still-open offer), then report the boot verdict. The single-process tests above neutralize
+    the reboot and so never exercise this resume path; here it is driven by pre-seeding the
+    state file exactly as install_complete_cb would have written it before the real reboot.
+    """
+    config, data_dir = confirm_config
+    # already booted into the (good) target slot, as after a successful trial boot
+    rauc_dbus_install_success_scenario(boot_slot='rootfs.1')
+
+    # state install_complete_cb persisted before the (real) reboot
+    state = data_dir / 'pending-confirmation'
+    state.write_text(f'[pending]\naction_id={hawkbit.id["action"]}\ntarget_slot=rootfs.1\n')
+
+    proc = run_pexpect(f'rauc-hawkbit-updater -c "{config}"')
+
+    # resumed at startup rather than the still-open offer being reinstalled
+    proc.expect(f'Resuming pending update confirmation for action {hawkbit.id["action"]} '
+                'after reboot')
+    proc.expect('Update confirmed after reboot')
+
+    proc.expect(TIMEOUT, timeout=2)
+    proc.terminate(force=True)
+    proc.expect(EOF)
+
+    assert not state.exists()
+    assert hawkbit.get_action_status()[0]['type'] == 'finished'

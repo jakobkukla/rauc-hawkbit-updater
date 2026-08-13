@@ -780,7 +780,8 @@ static long json_get_sleeptime(JsonNode *root)
         g_mutex_lock(&active_action->mutex);
         if (active_action->state == ACTION_STATE_PROCESSING ||
             active_action->state == ACTION_STATE_DOWNLOADING ||
-            active_action->state == ACTION_STATE_CANCEL_REQUESTED) {
+            active_action->state == ACTION_STATE_CANCEL_REQUESTED ||
+            active_action->state == ACTION_STATE_AWAITING_VERDICT) {
                 g_mutex_unlock(&active_action->mutex);
                 return 5L;
         }
@@ -1018,7 +1019,7 @@ gboolean install_complete_cb(gpointer ptr)
                 }
 
                 if (deferred) {
-                        active_action->state = ACTION_STATE_SUCCESS;
+                        active_action->state = ACTION_STATE_AWAITING_VERDICT;
                         if (!feedback_progress(feedback_url, active_action->id,
                                                "Software bundle installed, confirming after reboot.",
                                                &error))
@@ -1523,8 +1524,14 @@ static gboolean process_cancel(JsonNode *req_root, GError **error)
         case ACTION_STATE_ERROR:
                 g_debug("Cancelation impossible, installation failed already");
                 break;
+        case ACTION_STATE_AWAITING_VERDICT:
+                // update already installed and rebooted into, awaiting its boot verdict
+                msg = g_strdup("Cancelation impossible, update already installed and awaiting "
+                               "post-reboot confirmation.");
+        // fall through
         case ACTION_STATE_INSTALLING:
-                msg = g_strdup("Cancelation impossible, installation started already.");
+                if (!msg)
+                        msg = g_strdup("Cancelation impossible, installation started already.");
                 res = feedback(feedback_url, stop_id, msg, "success", "rejected", error);
                 if (res) {
                         res = FALSE;
@@ -1608,19 +1615,26 @@ static gboolean confirm_pending_deployment(void)
                 success = FALSE;
         }
 
+        // Resolve the AWAITING_VERDICT action once the verdict is reported: leaving it stale would
+        // keep it >= ACTION_STATE_PROCESSING and wrongly block every future deployment. On a
+        // transient failure keep AWAITING_VERDICT and retry next poll.
         feedback_url = build_api_url("deploymentBase/%s/feedback", action_id);
+        g_mutex_lock(&active_action->mutex);
         if (feedback(feedback_url, action_id,
                      success ? "Update confirmed after reboot."
                      : "Update rolled back to previous slot after reboot.",
                      success ? "success" : "failure", "closed", &error)) {
                 pending_state_clear();
+                active_action->state = success ? ACTION_STATE_SUCCESS : ACTION_STATE_ERROR;
         } else if (g_error_matches(error, RHU_HAWKBIT_CLIENT_HTTP_ERROR, 404) ||
                    g_error_matches(error, RHU_HAWKBIT_CLIENT_HTTP_ERROR, 410)) {
                 g_warning("Pending action %s no longer exists on server, dropping it.", action_id);
                 pending_state_clear();
+                active_action->state = ACTION_STATE_NONE;
         } else {
                 g_warning("Failed to report update confirmation, will retry: %s", error->message);
         }
+        g_mutex_unlock(&active_action->mutex);
 
         return TRUE;
 }
@@ -1750,6 +1764,20 @@ int hawkbit_start_service_sync()
 #endif
 
         active_action = action_new();
+
+        // A deferred post-reboot confirmation persisted across the reboot; resume it as a
+        // first-class action so cancel handling, the deployment guard and poll timing treat
+        // it like any other in-progress action.
+        if (hawkbit_config->confirm_after_reboot) {
+                g_autofree gchar *pending_id = NULL;
+
+                if (pending_state_read(&pending_id, NULL, NULL)) {
+                        g_message("Resuming pending update confirmation for action %s after reboot.",
+                                  pending_id);
+                        active_action->id = g_steal_pointer(&pending_id);
+                        active_action->state = ACTION_STATE_AWAITING_VERDICT;
+                }
+        }
 
         ctx = g_main_context_new();
         cdata.loop = g_main_loop_new(ctx, FALSE);

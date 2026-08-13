@@ -60,6 +60,7 @@ enum ActionState {
         ACTION_STATE_DOWNLOADING,
         ACTION_STATE_INSTALLING,
         ACTION_STATE_CANCEL_REQUESTED,
+        ACTION_STATE_AWAITING_VERDICT,      /**< installed, rebooted, awaiting post-reboot boot verdict */
 };
 
 /**
